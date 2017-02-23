@@ -1,3 +1,5 @@
+import random
+import math
 from faker import Factory
 import threading
 import pytest
@@ -5,6 +7,7 @@ import datetime
 from share.models import HarvestLog
 from share.models import SourceConfig
 from share.models import SourceUniqueIdentifier
+from django.db import DatabaseError
 from share.models import RawDatum
 from share.harvest import BaseHarvester
 from share.tasks import HarvesterTask
@@ -85,17 +88,6 @@ def harvest(*args, **kwargs):
 
 
 @pytest.mark.django_db
-class TestHarvestTaskSuccess:
-
-    def test_succeeds(self, source_config):
-        harvest(source_config.source.user.id, source_config.label)
-        assert HarvestLog.objects.filter(status=HarvestLog.STATUS.succeeded).count() == 1
-
-    def test_increments_completions(self, source_config):
-        pass
-
-
-@pytest.mark.django_db
 class TestHarvestTask:
 
     def test_errors_on_locked(self, committed_source_config):
@@ -137,21 +129,51 @@ class TestHarvestTask:
         source_config.harvester.get_class().do_harvest.side_effect = ValueError('In a test')
         with pytest.raises(ValueError) as e:
             harvest(source_config.source.user.id, source_config.label)
-        assert e.value.args == ('In a test', )
+
         log = HarvestLog.objects.get(source_config=source_config)
 
+        assert e.value.args == ('In a test', )
         assert log.status == HarvestLog.STATUS.failed
         assert log.completions == 0
         assert 'ValueError: In a test' in log.error
 
+    def test_harvest_database_error(self, source_config):
+        def do_harvest(*args, **kwargs):
+            yield ('doc1', b'doc1data')
+            yield ('doc2', b'doc2data')
+            yield ('doc3', b'doc3data')
+            raise DatabaseError('In a test')
+        source_config.harvester.get_class().do_harvest.side_effect = do_harvest
+
+        with pytest.raises(DatabaseError) as e:
+            harvest(source_config.source.user.id, source_config.label)
+
+        log = HarvestLog.objects.get(source_config=source_config)
+
+        assert log.raw_data.count() == 0
+        assert e.value.args == ('In a test', )
+        assert log.status == HarvestLog.STATUS.failed
+        assert log.completions == 0
+        assert 'DatabaseError: In a test' in log.error
+
     def test_partial_harvest_fails(self, source_config):
-        pass
+        def do_harvest(*args, **kwargs):
+            yield ('doc1', b'doc1data')
+            yield ('doc2', b'doc2data')
+            yield ('doc3', b'doc3data')
+            raise ValueError('In a test')
+        source_config.harvester.get_class().do_harvest.side_effect = do_harvest
 
-    def test_marks_log_failed_with_tb(self, source_config):
-        pass
+        with pytest.raises(ValueError) as e:
+            harvest(source_config.source.user.id, source_config.label)
 
-    def test_links_partial_results(self, source_config):
-        pass
+        log = HarvestLog.objects.get(source_config=source_config)
+
+        assert log.raw_data.count() == 3
+        assert e.value.args == ('In a test', )
+        assert log.status == HarvestLog.STATUS.failed
+        assert log.completions == 0
+        assert 'ValueError: In a test' in log.error
 
     def test_log_links_does_not_shadow_original(self, source_config):
         pass
@@ -159,28 +181,8 @@ class TestHarvestTask:
     def test_failed_linking_rollsback(self, source_config):
         pass
 
-    def test_starts_ingest_tasks(self, source_config):
+    def test_force_always_works(self, source_config):
         pass
-
-    def test_does_not_start_ingest_tasks(self, source_config):
-        pass
-
-    def test_force_start_ingest_tasks(self, source_config):
-        pass
-
-    def test_succeeds(self, source_config):
-        fake = Factory.create()
-        source_config.harvester.get_class()._rawdata = [(fake.sentence(), fake.text()) for _ in range(200)]
-
-        harvest(source_config.source.user.id, source_config.label)
-
-        log = HarvestLog.objects.get(source_config=source_config)
-
-        assert SourceUniqueIdentifier.objects.all().count() == 200
-        assert RawDatum.objects.all().count() == 200
-        assert log.status == HarvestLog.STATUS.succeeded
-        assert log.completions == 1
-        assert log.raw_data.all().count() == 200
 
     def test_log_values(self, source_config):
         harvest(source_config.source.user.id, source_config.label)
@@ -202,3 +204,57 @@ class TestHarvestTask:
 
     def test_superfluous(self, source_config):
         pass
+
+    def test_limit(self, source_config):
+        pass
+
+    @pytest.mark.parametrize('count, rediscovered, superfluous, limit, ingest', {
+        (count, int(rediscovered), False, int(limit) if limit is not None else None, True)
+        for count in (0, 1, 500, 501, 1010)
+        for limit in (None, 0, 1, count * .5, count, count * 2)
+        for rediscovered in (0, 1, count * .5, count)
+        if rediscovered <= count
+    } | {
+        (count, int(rediscovered), superfluous, None, ingest)
+        for count in (0, 150)
+        for ingest in (True, False)
+        for superfluous in (True, False)
+        for rediscovered in (0, count * .5, count)
+        if rediscovered <= count
+    })
+    def test_data_flow(self, source_config, monkeypatch, count, rediscovered, superfluous, limit, ingest, django_assert_num_queries):
+        assert rediscovered <= count, 'Y tho'
+
+        fake = Factory.create()
+        mock_ingest_task = mock.Mock()
+
+        monkeypatch.setattr('share.tasks.IngestTask', mock_ingest_task)
+        source_config.harvester.get_class()._rawdata = [(fake.sentence(), fake.binary(750)) for _ in range(count)]
+        list(RawDatum.objects.store_chunk(source_config, random.sample(source_config.harvester.get_class()._rawdata, rediscovered)))
+
+        # TODO Drop this number....
+        with django_assert_num_queries(15 + math.ceil((count if limit is None or count < limit else limit) / 500) * 3):
+            harvest(source_config.source.user.id, source_config.label, superfluous=superfluous, limit=limit, ingest=ingest)
+
+        log = HarvestLog.objects.get(source_config=source_config)
+
+        assert log.completions == 1
+        assert log.status == HarvestLog.STATUS.succeeded
+        assert log.raw_data.count() == (count if limit is None or count < limit else limit)
+
+        if limit is not None and rediscovered:
+            assert RawDatum.objects.filter().count() >= rediscovered
+            assert RawDatum.objects.filter().count() <= rediscovered + max(0, min(limit, count - rediscovered))
+        else:
+            assert RawDatum.objects.filter().count() == (count if limit is None or count < limit else limit)
+
+        if ingest:
+            if superfluous:
+                assert mock_ingest_task().apply_async.call_count == min(count, limit or 99999)
+            elif limit is not None:
+                assert mock_ingest_task().apply_async.call_count <= min(limit, count)
+                assert mock_ingest_task().apply_async.call_count >= min(limit, count) - rediscovered
+            else:
+                assert mock_ingest_task().apply_async.call_count == count - rediscovered
+        else:
+            assert mock_ingest_task().apply_async.call_count == 0

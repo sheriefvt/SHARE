@@ -14,7 +14,11 @@ from django.dispatch import receiver
 from django.core.urlresolvers import reverse
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
+from django.utils.deconstruct import deconstructible
 from oauth2_provider.models import AccessToken, Application
+from django.core.files.storage import Storage
+
+from db.deletion import DATABASE_CASCADE
 
 from osf_oauth2_adapter.apps import OsfOauth2AdapterConfig
 
@@ -186,3 +190,34 @@ class NormalizedData(models.Model):
 
     def __str__(self):
         return '{} created at {}'.format(self.source.get_short_name(), self.created_at)
+
+
+class FaviconImage(models.Model):
+    user = models.OneToOneField('ShareUser', on_delete=DATABASE_CASCADE)
+    image = models.BinaryField()
+
+
+@deconstructible
+class FaviconStorage(Storage):
+    def _open(self, name, mode='rb'):
+        assert mode == 'rb'
+        favicon = FaviconImage.objects.get(user__username=name)
+        return ContentFile(favicon.image)
+
+    def _save(self, name, content):
+        user = ShareUser.objects.get(username=name)
+        FaviconImage.objects.update_or_create(user_id=user.id, defaults={'image': content.read()})
+        return name
+
+    def delete(self, name):
+        FaviconImage.objects.get(user__username=name).delete()
+
+    def get_available_name(self, name, max_length=None):
+        return name
+
+    def url(self, name):
+        return reverse('user_favicon', kwargs={'username': name})
+
+
+def favicon_name(instance, filename):
+    return instance.username

@@ -59,6 +59,7 @@ class LoggedTask(celery.Task):
         self.setup(*self.args, **self.kwargs)
 
         assert issubclass(self.CELERY_TASK, CeleryTask)
+        # TODO optimize into 1 query with ON CONFLICT
         self.task, _ = self.CELERY_TASK.objects.update_or_create(
             uuid=self.request.id,
             defaults=self.log_values(),
@@ -120,10 +121,14 @@ class AppTask(LoggedTask):
 class SourceTask(LoggedTask):
 
     def setup(self, app_label, *args, **kwargs):
-        self.config = SourceConfig.objects.get(label=app_label)
+        self.config = SourceConfig.objects.select_related('harvester', 'transformer', 'source__user').get(label=app_label)
         self.source = self.config.source.user
         self.args = args
         self.kwargs = kwargs
+
+
+class IngestTask(SourceTask):
+    pass
 
 
 class HarvesterTask(SourceTask):
@@ -153,12 +158,13 @@ class HarvesterTask(SourceTask):
             'app_version': self.config.harvester.version,
         }
 
-    def do_run(self, start=None, end=None, limit=None, force=False, superfluous=False, ignore_disabled=False, **kwargs):
+    def do_run(self, start=None, end=None, limit=None, force=False, superfluous=False, ignore_disabled=False, ingest=True, **kwargs):
         # WARNING: Errors that occur here cannot be logged to the HarvestLog.
         start, end = self.resolve_args(start, end)
         logger.debug('Loading harvester for %r', self.config)
         harvester = self.config.get_harvester()
 
+        # TODO optimize into 1 query with ON CONFLICT
         log, created = HarvestLog.objects.get_or_create(
             end_date=end,
             start_date=start,
@@ -200,8 +206,12 @@ class HarvesterTask(SourceTask):
                                 logger.debug('Found new %r from %r', datum, self.config)
                             else:
                                 logger.debug('Rediscovered new %r from %r', datum, self.config)
+                    except DatabaseError as e:
+                        # DatabaseError force the transaction to be rolled back
+                        logger.exception('Database error occured while harvesting %r; bailing', self.config)
+                        raise e
                     except Exception as e:
-                        logger.warning('Harvesting %r failed; cleaning up', self.config)
+                        logger.exception('Harvesting %r failed; cleaning up', self.config)
                         error = e
 
                     logger.info('Collected %d new RawData from %r', len(datum_ids[True]), self.config)
@@ -226,14 +236,17 @@ class HarvesterTask(SourceTask):
                 elif error is not None and force:
                     logger.warning('Force is set to True; ignoring exception')
 
-                # TODO
-                # for raw_id in harvester.new_raw_ids:
-                #     task = IngestTask().apply_async((self.started_by.id, self.config.id, raw_id,))
-                #     logger.debug('Started normalizer task %s for %s', task, raw_id)
-
-                # if superfluous:
-                #     for raw_id in harvester.old_raw_ids:
-                #         pass
+                if not ingest:
+                    logger.info('Not starting IngestTasks, ingest = False')
+                else:
+                    # TODO
+                    for raw_id in datum_ids[True]:
+                        task = IngestTask().apply_async((self.started_by.id, self.config.id, raw_id,))
+                        logger.debug('Started normalizer task %s for %s', task, raw_id)
+                    if superfluous:
+                        for raw_id in datum_ids[False]:
+                            task = IngestTask().apply_async((self.started_by.id, self.config.id, raw_id,))
+                            logger.debug('Started normalizer task %s for %s', task, raw_id)
 
             except HarvesterConcurrencyError as e:
                 # If we did not create this log and the task ids don't match. There's a very good

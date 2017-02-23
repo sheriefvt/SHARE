@@ -13,6 +13,9 @@ from django.db import DatabaseError
 from django.db import connection
 from django.db import connections
 from django.db import models
+from django.db import DEFAULT_DB_ALIAS
+from django.db.models.query_utils import deferred_class_factory
+from django.db.models.query_utils import DeferredAttribute
 from django.utils.deconstruct import deconstructible
 from django.utils.translation import ugettext_lazy as _
 
@@ -247,6 +250,8 @@ class RawDatumManager(FuzzyCountManager):
         logger.debug('Linking RawData to %r', log)
         with connection.cursor() as cursor:
             for chunk in chunked(datum_ids, size=500):
+                if not chunk:
+                    break
                 cursor.execute('''
                     INSERT INTO "{table}"
                         ("{rawdatum}", "{harvestlog}")
@@ -261,16 +266,18 @@ class RawDatumManager(FuzzyCountManager):
                 ), [(raw_id, log.id) for raw_id in chunk])
         return True
 
-    def store_chunk(self, source_config, data, limit=None):
+    def store_chunk(self, source_config, data, limit=None, db=DEFAULT_DB_ALIAS):
         # (identifier, datum)
         done = 0
+
         with connection.cursor() as cursor:
             for chunk in chunked(data, 500):
-                if not chunk:
-                    break
 
                 if limit is not None and done + len(chunk) > limit:
                     chunk = chunk[:limit - done]
+
+                if not chunk:
+                    break
 
                 cursor.execute('''
                     INSERT INTO "{table}"
@@ -281,16 +288,17 @@ class RawDatumManager(FuzzyCountManager):
                         ("{identifier}", "{source_config}")
                     DO UPDATE SET
                         id = "{table}".id
-                    RETURNING id
+                    RETURNING {fields}
                 '''.format(
                     table=SourceUniqueIdentifier._meta.db_table,
                     identifier=SourceUniqueIdentifier._meta.get_field('identifier').column,
                     source_config=SourceUniqueIdentifier._meta.get_field('source_config').column,
                     values=', '.join('%s' for _ in range(len(chunk))),  # Nasty hack. Fix when psycopg2 2.7 is released with execute_values
+                    fields=', '.join('"{}"'.format(field.column) for field in SourceUniqueIdentifier._meta.concrete_fields),
                 ), [(identifier, source_config.id) for identifier, datum in chunk])
 
-                # fetchall returns a list of tuples. [(1, ), (2, ), ...]
-                suid_pks = [row[0] for row in cursor.fetchall()]
+                fields = [field.attname for field in SourceUniqueIdentifier._meta.concrete_fields]
+                suids = [SourceUniqueIdentifier.from_db(db, fields, row) for row in cursor.fetchall()]
 
                 cursor.execute('''
                     INSERT INTO "{table}"
@@ -310,18 +318,12 @@ class RawDatumManager(FuzzyCountManager):
                     created=RawDatum._meta.get_field('created').column,
                     values=', '.join('%s' for _ in range(len(chunk))),  # Nasty hack. Fix when psycopg2 2.7 is released with execute_values
                 ), [
-                    (suid_pk, sha256(datum).hexdigest(), datum, True)
-                    for suid_pk, (identifier, datum) in zip(suid_pks, chunk)
+                    (suid.pk, sha256(datum).hexdigest(), datum, True)
+                    for suid, (identifier, datum) in zip(suids, chunk)
                 ])
 
-                for i, (raw_datum_pk, hash, created) in enumerate(cursor.fetchall()):
-                    yield RawDatum(
-                        pk=raw_datum_pk,
-                        sha256=hash,
-                        created=created,
-                        datum=chunk[i][1],
-                        suid=SourceUniqueIdentifier(pk=suid_pks[i], identifier=chunk[i][0], source_config=source_config)
-                    )
+                for suid, row in zip(suids, cursor.fetchall()):
+                    yield MemoryFriendlyRawDatum.from_db(db, ('id', 'suid', 'sha256', 'created'), row[:1] + (suid, ) + row[1:])
 
                 done += len(chunk)
                 if limit is not None and done >= limit:
@@ -360,11 +362,19 @@ class RawDatum(models.Model):
 
     # Hacky field to allow us to tell if a RawDatum was updated or created in bulk inserts
     # Null default to avoid table rewrites
-    created = models.BooleanField(null=True, default=False)
+    created = models.NullBooleanField(null=True, default=False)
 
     logs = models.ManyToManyField('HarvestLog', related_name='raw_data')
 
     objects = RawDatumManager()
+
+    _MemoryFriendlyCls = None
+
+    @classmethod
+    def MemoryFriendly(cls, *args, **kwargs):
+        if not cls._MemoryFriendlyCls:
+            cls._MemoryFriendlyCls = deferred_class_factory(cls, ('datum', ))
+        return cls._MemoryFriendlyCls(*args, **kwargs)
 
     class Meta:
         unique_together = ('suid', 'sha256')
@@ -374,3 +384,14 @@ class RawDatum(models.Model):
         return '<{}({}, {}...)>'.format(self.__class__.__name__, self.suid_id, self.sha256[:10])
 
     __str__ = __repr__
+
+
+# NOTE how this works changes in Django 1.10
+class MemoryFriendlyRawDatum(RawDatum):
+
+    datum = DeferredAttribute('datum', RawDatum)
+
+    _deferred = True
+
+    class Meta:
+        proxy = True

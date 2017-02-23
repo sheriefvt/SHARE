@@ -212,7 +212,7 @@ class DictHashingDict:
         return val
 
 
-def chunked(iterable, size=25):
+def chunked(iterable, size=25, fail_fast=False):
     iterable = iter(iterable)
     try:
         while True:
@@ -222,3 +222,7 @@ def chunked(iterable, size=25):
             yield l
     except StopIteration:
         yield l
+    except Exception as e:
+        if not fail_fast:
+            yield l
+        raise e

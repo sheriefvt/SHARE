@@ -688,20 +688,34 @@ class CreativeWork(Parser):
         raise KeyError()
 
     def text_list(self, data):
-        text_list = []
+        if isinstance(data, dict):
+            if '#text' in data:
+                return data['#text']
+            raise Exception('#text is not in {}'.format(data))
+
+        if isinstance(data, str):
+            return data
+
         if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    if '#text' in item:
-                        text_list.append(item['#text'])
-                        continue
-                elif isinstance(item, str):
-                    text_list.append(item)
+            text_list = []
+            for datum in (data or []):
+                if datum is None:
                     continue
-                logger.warning('#text is not in {} and it is not a string'.format(item))
+                if isinstance(datum, dict):
+                    if '#text' not in datum:
+                        logger.warning('Skipping %s, no #text key exists', datum)
+                        continue
+                    text_list.append(datum['#text'])
+                elif isinstance(datum, str):
+                    text_list.append(datum)
+                else:
+                    raise Exception(datum)
             return text_list
-        else:
-            raise Exception('{} is not a list.'.format(data))
+
+        if data is None:
+            return ''
+
+        raise TypeError(data)
 
 
 class DataciteTransformer(ChainTransformer):
